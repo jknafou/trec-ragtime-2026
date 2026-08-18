@@ -1,0 +1,500 @@
+# TREC RAGTIME 2026 — launch config for the mlir-omt-weak run.
+#
+#   run --config config/mlir-omt-weak.yml
+#
+# The file is the complete, self-contained run record: shared infrastructure, run
+# specifics and output routing are all inlined, so it is launchable and reproducible on
+# its own. The twelve fairness-shared blocks — llm, claim_commit, decomposition,
+# rag_loop, chunker, merge, translation, reconcile, packing, index_build, serialize and
+# topics — are duplicated across the mlir runs and must stay byte-identical. The only thing
+# that varies across the mlir family is which index the shared retrieval method queries
+# (retrieval.index = original | omt | omt_opus). See config/README.md for the run/track
+# table.
+#
+# Before launching, point execution.artifact_root at a writable directory on this machine
+# (or leave it unset and export RAGTIME_ARTIFACT_ROOT).
+
+run:
+  id: mlir-omt-weak
+  kind: e2e_agentic                    # T2 runs the same pipeline as T1 and T3 — decompose,
+                                       # k RAG loops, coverage-audit rounds — with
+                                       # retrieval.index the only thing that moves across
+                                       # the three mlir arms. coverage_audit._merge_retrieved
+                                       # accumulates every hit the loop sees into
+                                       # nugget.retrieved[]. Those scores break ties in the T2
+                                       # ranking, whose documents are the ones the committed
+                                       # claims cite across the loop's whole search history,
+                                       # rather than the hits of one raw query per nugget.
+  status: submitted
+  description: >
+    Decomposition-driven retrieval that queries the low-tier index (index=omt_opus):
+    an English query over OPUS-MT (~74 M per direction) English passages, i.e. monolingual.
+    The low-tier Task-2 point. Original against omt asks whether translating the corpus
+    helps retrieval at all; omt against omt_opus isolates translation tier over one
+    shared inventory.
+
+llm:
+  model: "Qwen/Qwen3.5-122B-A10B-FP8"
+  role: "decomposer + k parallel RAG loops + select-and-serialize projection"
+  decoding: { temperature: 0.7, top_p: 0.8, top_k: 20 }
+  pin: [model_id, prompt_version_hash, seed]
+  # Hang guard, not a latency budget: it exists to notice a wedged request, and is set
+  # well above the longest generation observed on the live fleet.
+  call_timeout_s: 1200
+
+# Claim commit is deterministic span grounding: a claim is kept iff its quote matches
+# verbatim against the passage. Language-neutral, and the check itself uses no model.
+claim_commit:
+  rule: "span-grounding — verbatim quote match of the claim against its cited passage"
+  properties: "deterministic, language-neutral; a verbatim substring match under canonical normalization"
+  # Same-turn re-decode of a claim whose span did not match. It does not consume a turn
+  # of budget.max_iters, so termination is unaffected.
+  max_retries: 2
+
+# Decomposition is a dynamic coverage loop (seed -> grow across rounds -> audit -> new
+# nuggets -> saturate), not one-shot. A nugget is a single-sentence question. There is one
+# decomposition per run, used for both T1 and T3: the seed round reads only the request and
+# is therefore identical across runs, while the coverage-audit rounds read retrieved
+# passages and diverge per corpus variant.
+decomposition:
+  policy: "dynamic coverage loop: seed from request (round 0, identical across runs) -> grow across coverage-audit rounds (1+, reads passages, diverges per variant) -> saturate"
+  usage: "one decomposition per run, shared by both T1 (report) and T3 (nuggets)"
+  model: "Qwen/Qwen3.5-122B-A10B-FP8"   # the same served instance as llm.model; validate
+                                        # asserts the two ids agree
+  output: guided_json                   # grammar-constrained and jsonschema-validated
+  decoding: { temperature: 0.7, top_p: 0.8, top_k: 20 }   # identical to llm.decoding
+  few_shot: { n: 3, exemplar_set: "autonuggetizer_v1" }   # exemplar_set is a versioned id
+                                        # whose text is a frozen constant in code, so an
+                                        # exemplar edit re-keys prompt_hash
+  k_band: [[2000, 4, 8], [5000, 8, 14], [10000, 14, 24]]  # [limit_threshold, k_min, k_max];
+                                        # every 2026 topic has limit 5000, so the middle
+                                        # row is the operative one
+  R_max: 8               # safety net on the number of coverage rounds; min_new and
+                         # low_streak are expected to saturate well before it
+  min_new: 1
+  low_streak: 2
+  vital_cutoff: 0.5      # midpoint of weight in [0,1]; `vital` is monitoring-only and
+                         # budget-fit uses the continuous weight
+  dedup: { llm_paraphrase_merge: true, cosine_cutoff: 0.80 }
+                         # the embedding step only proposes candidate pairs and the LLM
+                         # merge decides, so a lower cutoff is the safe direction
+  retrieval_access: { seed: false, audit: true }   # the seed round reads only the request
+  audit_evidence: reuse                 # the auditor issues no queries of its own
+  grounding_gate: on_topic
+  background: true       # written as a YAML boolean, never bare `on`
+
+
+# The RAG loop: one agentic gather/close conversation per open nugget, on the shared vLLM.
+# Fairness-shared and byte-identical across a family: only passage_lang (what the loop
+# reads) and retrieval.index (what it searches) may differ, never how hard it looks before
+# it answers.
+rag_loop:
+  budget:
+    min_searches: 2         # abstain is illegal until this many searches have run
+    max_iters: 8            # generation calls per loop (backstop)
+    max_searches: 5         # search actions per loop (backstop)
+    token_budget: 20000     # per-loop hard token ceiling (backstop)
+    # At this fraction of max_iters a loop that already holds committed claims is told once
+    # that its turns are running out. It adds no action; submit_answer is on the menu every
+    # turn. `null` disables the warning.
+    warn_at_frac: 0.6
+  search_top_k: 20          # passages returned per search action
+  fan_out:
+    # Loops per topic. Set explicitly rather than derived from KV headroom, because the
+    # derivation divides the cache by what a request could consume rather than by what
+    # budget.token_budget allows, and over-provisions by ~6.5x.
+    concurrency: 16
+  emission: action          # one grammar-constrained {rationale, action} per turn
+  abstain: gated            # unlocks only when n_search >= min_searches and n_answer_fail >= 1
+
+chunker:
+  config:
+    token_budget: 512
+    overlap_frac: 0.15
+    segmenter_model: sat-3l-sm
+    tokenizer_id: "BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181"
+    strip_boilerplate: true
+    boilerplate_rules: "v2"
+    prefer_paragraph_break: true
+    prefer_paragraph_break_min_fill: 0.6
+    data_model: "v2"        # documents/sentences spine; text stored once as spans
+  hash: "<logged at runtime>"
+
+# OMT translation (our NLLB arm). Semantic fields only: anything that changes the
+# translated bytes. The translated corpus is built once per family and read by every
+# member, and this block's hash keys both the artifact path and every row's
+# model_config_hash. Shard counts, the CT2 checkpoint path and the GPU shape key are
+# throughput facts and live in the non-shared `execution` block below.
+translation:
+  config:
+    engine: ctranslate2
+    omt_model: nllb-200-3.3B      # the semantic model identity; the machine-local CT2
+                                  # directory is execution.ct2_model_dir
+    target_lang: eng_Latn
+    source_langs: [spa_Latn, rus_Cyrl, zho_Hans, zho_Hant]   # eng_Latn never reaches MT
+    beam_size: 4                  # deterministic beam search, never sampling
+    no_repeat_ngram_size: 4       # repetition guard; hashed, not a client-side default
+    compute_type: float16         # passed explicitly to ctranslate2.Translator, so the
+                                  # hashed record and the engine state the same fact
+    batch_type: tokens
+    max_input_length: 512         # NLLB's cap; passed explicitly (CT2 defaults to 1024)
+    # Both bucket-composition bounds are semantic: composition determines padding, padding
+    # perturbs CT2 numerics, so the same shard must compose the same buckets on every GPU.
+    bucket_token_budget: 16384
+    max_sentences_per_bucket: 512
+    # Direction-aware decode cap, computed once per bucket:
+    #   min(max_decoding_cap, ceil(max(len_ratio_a[dir]) * bucket_max_src_tokens + len_ratio_b))
+    len_ratio_a: { zho_Hans: 2.0, zho_Hant: 2.0, rus_Cyrl: 1.4, spa_Latn: 1.3 }
+    len_ratio_b: 10
+    max_decoding_cap: 512
+    merge_marker: "§"             # joins a merged unit's constituents; the most reliably
+                                  # round-tripped marker of those compared
+    qe_model: Unbabel/wmt22-cometkiwi-da
+    qe_threshold: null            # QE gate disabled: there is no dev set to set a
+                                  # threshold against. The per-sentence CometKiwi score is
+                                  # reported as a distribution, never thresholded. The
+                                  # literal null is retained because changing it moves
+                                  # translation_hash and orphans the built corpus.
+    join_sep: { latin_cyrillic: " ", cjk: "" }   # The joiner applied is a single space for
+                                  # every source language. The leaf sits inside the hashed
+                                  # translation block, so its value is part of
+                                  # translation_hash and of the built corpus's identity.
+  hash: "<logged at runtime>"
+
+# Post-chunk sentence merge: the translation-unit rule, keyed by its own hash so editing it
+# never changes chunker.hash and never invalidates the frozen sentence spine. It groups
+# sub-threshold sentences into units MT sees as one string; sentence_id stays the
+# citation unit and the map is purely additive. Merges are paragraph-local. English is
+# excluded because it is identity pass-through and is never translated.
+merge:
+  merge_short_sentences: true
+  min_sentence_tokens: 16              # BGE-M3 content tokens (the chunker's own unit)
+  merge_cap_frac: 0.15                 # of the content budget, so ~76 tokens at budget 512
+  merge_cross_paragraph: "singleton_only"   # cross a paragraph only for a whole-paragraph unit
+  merge_languages: ["zh", "ru", "es"]  # the translated languages; en is excluded by design
+
+# Sentence reconciliation: the last corpus substage and the sole producer of a passage. It
+# reads the raw, marker-bearing MT text and decides, per merge unit, whether the marker
+# split-back survived. If it did, each constituent keeps its own sentence_id, span and
+# English segment; if it did not, the constituents fuse into one sentence spanning their
+# union. Each document is then renumbered densely and re-packed into passages, and the
+# marker is scrubbed exactly once, here. Hashed on its own and folded, with the chunker,
+# merge and translation hashes, into the composite final/<recon12>/ path level.
+reconcile:
+  split_back: true        # try the marker split-back before fusing; false means always fuse
+  min_segment_chars: 1    # a shorter returned segment is a refusal, so fuse the unit
+  store_identity_translations: false   # English has no translation, so no identity copy is
+                                       # stored under a translations/omt name. The code
+                                       # default is true so that a config lacking this key
+                                       # still hashes and produces what it always did.
+
+# Passage packing, split out of `reconcile`: fusion decides which sentences
+# exist, packing decides how they are grouped into passages, and grouping cannot change the
+# inventory. Keeping them in one block would re-key recon12 on every packing edit. So
+# recon12 = H(chunker, merge, translation, reconcile) and passages hang off it at
+# final/<recon12>/passages/<pack12>/. Fairness-shared: passages must be identical across
+# the three renderings or the Task-2 comparison is not controlled.
+packing:
+  pack_length: len_max                 # native | len_max (max over the 3 renderings)
+  pack_budget: 511                     # content 509 + <s>/</s> + [unused1] doc marker =
+                                       # 512 positions exactly, the XLM-R ceiling. PyLate
+                                       # prepends a document-marker token, so positions =
+                                       # content + 3 and 512 would overflow.
+  len_max_tokenizer_id: "BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181"
+
+# Corpus indexation: the build-time index recipe. One method applied byte-identically to
+# the three renderings (original/omt/omt_opus), so the only thing that differs between the
+# three indexes is the passage text encoded. That is the whole basis of the Task-2
+# comparison, hence a fairness-shared block. Hashed on its own and folded into the index
+# path level (final/<recon12>/index/<index12>/), so a recipe edit resolves to a fresh index
+# beside the same corpus and can never be served from a stale one.
+#
+# Query-time knobs (rrf, reranker, and the `index` knob itself) stay in `retrieval`;
+# machine and throughput facts stay in the non-shared `execution` block below. Encode
+# composition is semantic and lives here, for the same reason as translation's bucket
+# bounds: composition changes the stored bytes, while GPU architecture does not.
+index_build:
+  config:
+    variants: [original, omt, omt_opus]   # the three indexes built, never which one a run
+                                          # searches (that is the retrieval.index knob)
+    shard_by: source_lang                 # 4 shards en/es/ru/zh; a query fans and RRF-merges
+    english_once: true                    # (*, en) is built once and referenced by all
+                                          # three manifests: the English text is identical
+                                          # in every rendering
+
+    # --- dense leg: exact FAISS over BGE-M3 ---------------------------------------------
+    # BGE-M3 rather than a general-purpose embedding model on language-fairness grounds: it
+    # is the tokenizer the corpus was already chunked with (same SHA as
+    # chunker.config.tokenizer_id), so the index's unit and the chunker's unit are the same
+    # unit by construction, and it carries no instruction-prefix bias channel.
+    dense_model: "BAAI/bge-m3"
+    dense_revision: "5617a9f61b028005a4858fdac845db406aefb181"
+    dense_tokenizer_id: "BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181"
+    dense_engine: faiss
+    ann_factory: "Flat"            # exact IndexFlatIP. A compressed factory such as
+                                   # "OPQ64,IVF16384_HNSW32,PQ64" is permitted only with a
+                                   # measured memory or latency reason.
+    nprobe: null                   # flat search is exhaustive by definition
+    quantizer_train_seed: 0        # unused under Flat; declared because a seed is never
+                                   # hardcoded in code
+    quantizer_train_sample: 0      # 0 means train on every buffered vector
+
+    # --- learned-sparse leg: MILCO -> Seismic -------------------------------------------
+    sparse_model: "omai-research/milco-650m"
+    sparse_model_revision: "567aeb03a5756c1e42793b9113925b4945ed5767"   # a git SHA, not a
+                                   # tag: the repo publishes neither, so a branch pin would
+                                   # let the weights move under a built index
+    sparse_pivot_tokenizer_id: "BAAI/bge-m3-unsupervised@46f03bc86361cf88102b0b517b36c8259f2946b1"
+                                   # the second repo MILCO resolves by repo id at load time,
+                                   # with no revision of its own, so sparse_model_revision
+                                   # does not pin it
+    sparse_max_length: 8192        # MILCO's own model_max_length: the model
+                                   # ceiling rather than the observed corpus maximum, so a
+                                   # longer future document cannot silently truncate.
+    sparse_engine: seismic
+    # Seismic build parameters, declared explicitly rather than left at library defaults:
+    # they change the index bytes, and an undeclared default is hidden state keying a
+    # fairness-shared artifact.
+    seismic_min_cluster_size: 2
+    seismic_centroid_fraction: 0.05
+                                   # inside the vendor's recommended {0.05, 0.1, 0.2}; the
+                                   # 0.05 and 0.10 builds returned identical top-100 lists
+                                   # on 101 of 103 topics, and 0.05 is ~16% smaller resident
+    seismic_top_k: 300             # keep only the 300 heaviest components of each passage,
+                                   # cut at assemble time (ties broken on component id
+                                   # ascending, so the build stays byte-reproducible).
+                                   # MILCO emits ~819 nnz/passage, and its own paper reports
+                                   # only marginal MIRACL gains beyond 300. This is an
+                                   # assemble key and never an encode one: the stored
+                                   # vectors are the encoder's raw output, so re-tuning it
+                                   # costs a CPU re-assemble. 0 would keep every component.
+    # The six parameters below are pyseismic-lsr's own defaults, declared at their current
+    # effective values so that behaviour is unchanged and the record is complete.
+    seismic_n_postings: 3500
+    seismic_summary_energy: 0.4
+    seismic_max_fraction: 1.5
+    seismic_doc_cut: 15
+    seismic_query_cut: 200
+    seismic_heap_factor: 1.0
+
+    # --- late-interaction spine: MTD under PyLate / fast-plaid --------------------------
+    spine_model: "hltcoe/plaidx-large-neuclir-mtd-mix-passages-mt5xxl-engeng"
+    spine_model_revision: "1fb92d4d51a3e60d9942c0654e71428f29c7b5d8"
+    late_interaction_tokenizer_id: "hltcoe/plaidx-large-neuclir-mtd-mix-passages-mt5xxl-engeng@1fb92d4d51a3e60d9942c0654e71428f29c7b5d8"
+                                   # XLM-R's 250002 vocabulary again, but a separate model
+                                   # instance from the dense leg; tokenizer identity is
+                                   # recorded per leg
+    spine_engine: "pylate+fast_plaid"   # engine family; the exact fast-plaid pin is in uv.lock
+    query_length: 32               # pinned explicitly rather than deferred to the
+                                   # checkpoint metadata
+    # The device PLAID searches on. Declared because it is a scientific variable rather than
+    # a speed knob: CPU and CUDA MaxSim disagree well inside the reranker's input pool.
+    query_plaid_device: "cuda:0"
+    # The dense encoder's device for query-side use (the decompose paraphrase dedup). CPU
+    # because the online worker is co-located with vLLM on the same GPU pair and vLLM at
+    # gpu_memory_utilization 0.92 leaves no room for a second resident encoder. It is a
+    # query-time key, excluded from index_hash, and is set identically in all six configs
+    # so it cannot bias the translation contrast.
+    query_encode_device: "cpu"
+    document_length: 512           # must be >= packing.pack_budget (511); enforced at
+                                   # bring-up by index._assert_window_covers_packing. The
+                                   # checkpoint is xlm-roberta with
+                                   # max_position_embeddings 514.
+    plaid_nbits: 2                 # PLAID residual compression, the least-compressed of the
+                                   # two levels that hold rank-1 self-retrieval
+    plaid_part_passages: 131072    # part sharding. fast-plaid's `create` must receive a
+                                   # shard in one add_documents call, and at corpus grain
+                                   # that buffer is far too large for one worker, so the leg
+                                   # is cut into parts of this many passages, one call each,
+                                   # fan-merged at query time. 2**17 x 512 positions x 128
+                                   # dim x 4 B = 32 GiB worst case in fp32. Parts at this
+                                   # size: en 23 / es 20 / zh 21 / ru 14.
+
+    # --- encode composition: semantic, hashed here, never in `execution` ----------------
+    # For MT each sentence is translated once, so bucket composition is a reproducibility
+    # concern only. For the index the same passage is encoded three times, once per
+    # rendering, and the comparison between those three is the experiment, so composition
+    # must match across the per-rendering builds, which only a hashed key guarantees.
+    encode_batch_token_budget: 8192   # serving.batching.Tier's own default
+    encode_max_items: 64              # ditto
+    encode_device: "cuda"          # read by serving.registry's MILCO/MTD clients. Hashed
+                                   # rather than placed in `execution` on the same
+                                   # precedent as translation.config.compute_type: device
+                                   # and dtype change the forward-pass numerics. Pinned
+                                   # "cuda" and never "auto", because "auto" hashes
+                                   # identically while resolving to different numerics.
+    # --- the vectorize/assemble split: block size, store form, assemble device ----------
+    # The build is two halves, vectorize (GPU) and assemble (CPU), so an assemble-only
+    # recipe change reuses the vectors. preprocess.index.ENCODE_KEYS/ASSEMBLE_KEYS file
+    # every key here on exactly one side of that line, and a partition test derived from
+    # config.schema.INDEX_BUILD_CONFIG fails if a key is filed on neither.
+    encode_block_passages: 131072  # the vectorize unit, equal to plaid_part_passages so one
+                                   # block is exactly one assemble part and assemble streams
+                                   # whole blocks with no gather. Hashed, because the block
+                                   # is the order the batcher buckets within, so its size
+                                   # decides batch membership and therefore the vectors.
+    dense_store_dtype: "float32"   # the leg is exact IndexFlatIP, so a lossy stored copy of
+                                   # what FAISS holds at full width buys nothing
+    sparse_store_format: "seismic_u30_f32"
+                                   # Seismic's own (U30 component strings, f32 values) pair
+    late_interaction_store_dtype: "float16"
+                                   # the assembled index is byte-identical to the
+                                   # fp32-stored one, at half the stored size. It does not
+                                   # halve the worker's peak: fast-plaid materialises fp32
+                                   # whatever it is handed, so size --mem from the
+                                   # materialised figure.
+    assemble_device: "cpu"         # chosen on measurement rather than as a fallback:
+                                   # assembly's two expensive steps are both CPU-bound, and
+                                   # the CPU k-means path is reproducible run to run where
+                                   # the CUDA one is not. Pinned like encode_device, never
+                                   # "auto".
+
+  hash: "<logged at runtime>"
+
+serialize:
+  # Select and serialize. Fairness-shared: byte-identical across every run in a family, so a
+  # translation delta can never be an artifact of a different selection policy.
+  #
+  # The three values below are untuned. There is no dev set and no qrels, so they are
+  # defensible recall-biased starting values and are recorded as such; they must not be
+  # quoted as tuned figures.
+  k_t3: 30                # T3 nugget budget. The validator sets no maxItems on nugget_bank,
+                          # so this is our choice rather than a track rule.
+  answers_cap: 5          # answers kept per nugget in T3; also uncapped by the validator
+  dedup_a_cutoff: 0.85    # terminal English-only answer dedup cosine, slightly below the
+                          # question cutoff because two phrasings of one answer are closer
+                          # than two phrasings of one question
+  # Spec-pinned below; these are not ours to tune.
+  rrf_k: 60               # common.fusion.rrf's own default; the spec pins 60
+  top_docs: 1000          # track rule: up to 1,000 results per query are accepted
+  dedup_q_cutoff: 0.90    # terminal English-only question dedup
+  # Behavioural knobs, present so the file is the complete record: each is readable by the
+  # stage, so leaving it out would not mean "no value" but "a value chosen in code".
+  answer_score: max_reference   # answer.score is derived, because nothing upstream writes
+                                # one. `max_reference` means max(references.values()).
+                                # Under this policy answer.score is the citation maximum,
+                                # so Tier 2's weight x score is weight x grounding.
+  validate: true                # run the official rag-run-validator as a hard gate. Never
+                                # false for a scored run: an invalid run is rejected
+                                # outright, which is worse than no run.
+  empty_fallback: true          # emit the neutral framing sentence rather than an empty
+                                # responses[]
+# Execution and scheduling knobs. Not a fairness-shared block and not chunking semantics:
+# this is how the family-shared corpus build parallelises. First-runner-wins builds the
+# corpus, so family members need not agree here.
+execution:
+  # Set this to a writable directory with room for the artifact tree (the vector store
+  # alone is ~1.9 TB). $RAGTIME_ARTIFACT_ROOT overrides it only when this key is unset; a
+  # disagreeing pair is a hard ConfigError rather than a precedence rule. It must be
+  # written equal in all six configs, because family_guard never compares `execution` and
+  # the corpus is family-shared, so two members naming two roots would build two corpora.
+  artifact_root: /path/to/artifact-root
+  corpus_shards: 2000     # roughly doc-balanced shards seeded onto the work queue
+  oversubscription: 10    # shards:workers ratio, so array width = ceil(shards/this)
+  # Corpus substage widths. Each substage after `chunk` reads its own
+  # <substage>_shards / <substage>_oversubscription pair; chunk reads the two keys above.
+  merge_shards: 120       # document-atomic row ranges over sentences.parquet (CPU)
+  merge_oversubscription: 4
+  translate_identity_shards: 200          # CPU-only English pass-through
+  translate_identity_oversubscription: 10
+  translate_shards: 1000                  # GPU NLLB arm (the non-English merge units)
+  translate_oversubscription: 5
+  reconcile_shards: 300                   # CPU re-pack over the four co-ordered tables
+  reconcile_oversubscription: 5
+  # The ShapeSet key the translate replica is allocated against. The shapes and their
+  # calibrated batch knobs live in config/serving/, so hardware facts never join a run family.
+  translate_shape_key: "facebook/nllb-200-3.3B@translate"
+  # Machine-local path to the CT2-converted checkpoint, not in
+  # translation.config: a filesystem path is not a semantic identity and must not enter the
+  # fairness hash. translation.config.omt_model is the identity that lands on rows.
+  ct2_model_dir: "runs/models/nllb-200-3.3B-ct2-fp16"
+  # Index substage widths and machine facts. Nothing here changes an index byte: the encode
+  # composition knobs that do are hashed in index_build.config above.
+  vectorize_shards: 188       # GPU half. One shard is one encode block of 131,072 passages:
+                              # en 23 (built once) + (es 20 + zh 21 + ru 14) x 3 renderings.
+  vectorize_oversubscription: 1
+  vectorize_blocks_per_task: 1  # blocks one worker claims per task. Block membership is
+                              # fixed by the hashed encode_block_passages, so this only
+                              # re-fans and moves no boundary.
+  assemble_shards: 188        # CPU half. One shard is one (variant, source_lang, part) leg
+                              # set. 188 rather than total_passages/part_size, because parts
+                              # are per-cell and each cell rounds up, so remainders do not
+                              # pool: en 23 + es 20x3 + ru 14x3 + zh 21x3.
+  assemble_max_age_s: 3600    # the reaper's window for this substage. It measures heartbeat
+                              # staleness, not part duration: the heartbeat forks a child
+                              # with its own GIL, so "stale" means 120 consecutive missed
+                              # 30 s stamps, which a live worker cannot produce. Not larger,
+                              # because a crashed or walltimed worker's part must return to
+                              # pending within an hour.
+  assemble_oversubscription: 1
+  len_max_shards: 200         # sidecar measurement fan-out (CPU)
+  len_max_oversubscription: 5
+  pack_shards: 200            # re-pack fan-out (CPU); reads the frozen inventory only
+  pack_oversubscription: 5
+                              # If the compressed ann_factory is ever enabled, OPQ/IVF
+                              # k-means reduction order becomes thread-dependent and this
+                              # knob must move into the hashed index_build.config in the
+                              # same change.
+  query_part_workers: 1       # query-time thread fan over a cell's index parts. It lives in
+                              # `execution` because it re-keys nothing and changes no
+                              # returned hit: the fan collects in submission order and
+                              # merges in part order. Naming both this and query_leg_workers
+                              # keeps the total bounded at 12 rather than 12x6 on a node
+                              # that also hosts the shared vLLM. Absent means
+                              # min(8, SLURM_CPUS_PER_TASK//2); 0 means sequential.
+  query_leg_workers: 12       # query-time thread fan over (leg x language cell); same
+                              # re-keys-nothing rule. The two widths are resolved together.
+
+topics:
+  # The request set this run reads. Fairness-shared: the T1/T3 contrast is Original minus
+  # OMT over the same requests, so two members of a family reading different topics files
+  # are not comparable at all. Named here rather than derived in code, because the file is
+  # the complete run record; resolution against a root is the caller's decision, exactly as
+  # with the outputs[].path entries.
+  path: topics/topics.all.2026.v0625-fix.jsonl
+
+# One seed. The agentic loop samples at temperature 0.7, so a single seed is one draw and
+# per-topic variance is not measurable: every number reported from this run is a point
+# estimate. The trade is deliberate, taken so that a run cut short yields full topic
+# coverage at one seed rather than several draws of a few topics.
+seeds: 1
+citations: "always original doc_id"
+languages: [zh, en, ru, es]   # RAGTIME 2026 corpus: Chinese/English/Russian/Spanish
+
+# --- retrieval block (the index is the only thing that differs between mlir runs) ---
+# Task-2 design: one shared indexing method builds three indexes, one per corpus rendering
+# (original | omt | omt_opus), sharing passage ids across all three. Each mlir run queries
+# exactly one index with the same retrieval method and returns one ranked list of passage
+# ids; because the ids are shared, the three runs are directly comparable on the same
+# qrels. This run queries index=omt_opus, an English query over OPUS-MT English-translated
+# passages, i.e. monolingual.
+retrieval:
+  spine:  "late-interaction (PyLate over the fast-plaid PLAID engine), stratified per-language"
+  dense:  "BAAI/bge-m3"               # native 1024-dim, exact IndexFlatIP
+  sparse: "omai-research/milco-650m"  # learned-sparse -> Seismic
+  rrf: { mode: rank, k: 60, quality_gated: true }   # fuse per-nugget/per-language lists
+                                      # into one ranked list
+  reranker: { model: "Qwen/Qwen3-Reranker-4B", depth: 100 }   # the organisation prefix is
+                                      # required: the bare name is not a resolvable
+                                      # checkpoint id
+  # The retrieval block's declared candidate depth. This run is `kind: e2e_agentic`, so its
+  # nugget.retrieved[] comes from the RAG loop's own search actions, at
+  # rag_loop.search_top_k (20).
+  #
+  # family_guard does not compare this leaf: `retrieval` is not a shared block and cannot
+  # become one, because `index` is this family's moving knob.
+  top_k: 100
+  index: omt_opus       # the only thing that varies across mlir runs
+
+# --- output routing ---
+outputs:
+  - task: 2
+    track: retrieval
+    path: "submissions/retrieval/run_3.txt"
+    format: "6-column TREC run (request_id Q0 doc_id rank score run_id)"
+    run_id: "mlir-omt-weak"
+    # The ranking named here is the one that shipped, in select_serialize/task2_claims.py, and it
+    # is the wording filed with the submission.
+    run_desc: "Decomposition-driven retrieval searching the low-tier index (the corpus machine-translated to English with Opus-MT; monolingual; PLAID-X + Qwen3 rerank), with documents ranked by the accumulated claim_importance x nugget_importance of the committed claims citing them, ties broken by reranker score. Contrasts with mlir-omt (high-tier NLLB-200-3.3B) over the SAME passage inventory, so translation TIER is the only variable."
+
+team_id: "BiTeM (HES-SO Geneva)"

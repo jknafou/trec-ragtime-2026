@@ -1,0 +1,140 @@
+{
+  "name": "rsvc-original-1234567",
+  "pid": 100001,
+  "job_id": "1234567",
+  "node": "gpu000.cluster",
+  "heartbeat": 1786471515.7250931,
+  "ready": true,
+  "cold_load_s": 1440.6,
+  "boot": {
+    "open_cells_s": 5.3,
+    "warm_cpu": {
+      "parts": 78,
+      "legs": [
+        "dense",
+        "sparse"
+      ],
+      "workers": 12,
+      "seconds": 1005.3
+    },
+    "plaid_local": {
+      "root": "/hosttmp/rsvc-original-1234567",
+      "parts": 78,
+      "copied_gib": 0.0,
+      "seconds": 76.1,
+      "verified_files": 2476,
+      "overlapped": true,
+      "residual_s": 0.0
+    },
+    "pre_fork": {
+      "torch_cuda_initialized": false,
+      "nvidia_fds": [],
+      "threads": [
+        "MainThread"
+      ]
+    },
+    "warm_plaid_s": 253.2,
+    "warm_plaid_parts": 78,
+    "rerank_load_s": 43.1,
+    "cold_load_s": 1440.6
+  },
+  "index_hash": "949acf17d993fcf60a7f887fbd042bb5535f8ef03e1ca6f7f91ed70fbdcb160b",
+  "rendering": "original",
+  "rendering_source": {
+    "index": "original",
+    "from_config": "original",
+    "override": false
+  },
+  "passage_lang": "original",
+  "config": "config/e2e-original.yml",
+  "queue": "<repo>/logs/rsvc/queue/original",
+  "slot": "rsvc-original-1234567",
+  "tier": "deploy",
+  "gpu_model": "nvidia_a100_80gb_pcie",
+  "degraded": [],
+  "gpu": [
+    {
+      "index": 0,
+      "name": "NVIDIA A100 80GB PCIe",
+      "used_gib": 33.72,
+      "total_gib": 80.0,
+      "util_pct": 0.0
+    },
+    {
+      "index": 1,
+      "name": "NVIDIA A100 80GB PCIe",
+      "used_gib": 29.36,
+      "total_gib": 80.0,
+      "util_pct": 0.0
+    },
+    {
+      "index": 2,
+      "name": "NVIDIA A100 80GB PCIe",
+      "used_gib": 18.53,
+      "total_gib": 80.0,
+      "util_pct": 0.0
+    },
+    {
+      "index": 3,
+      "name": "NVIDIA A100 80GB PCIe",
+      "used_gib": 26.84,
+      "total_gib": 80.0,
+      "util_pct": 0.0
+    },
+    {
+      "index": 4,
+      "name": "NVIDIA A100 80GB PCIe",
+      "used_gib": 0.0,
+      "total_gib": 80.0,
+      "util_pct": 0.0
+    },
+    {
+      "index": 5,
+      "name": "NVIDIA A100 80GB PCIe",
+      "used_gib": 7.92,
+      "total_gib": 80.0,
+      "util_pct": 0.0
+    }
+  ],
+  "host": {
+    "self_max_rss_gib": 181.8,
+    "cg_current_gib": 176.9,
+    "cg_anon_gib": 173.7,
+    "cg_file_gib": 1.3,
+    "cg_max_gib": null,
+    "mem_total_gib": 1007.7,
+    "mem_available_gib": 745.8,
+    "page_cache_gib": 761.9
+  },
+  "cells": {
+    "en": 23,
+    "es": 20,
+    "ru": 14,
+    "zh": 21
+  },
+  "replicas": [],
+  "threads": {
+    "affinity_cpus": 96,
+    "cpu_count": 128,
+    "env": {
+      "OMP_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "NUMEXPR_NUM_THREADS": "1",
+      "RAYON_NUM_THREADS": "6",
+      "SLURM_CPUS_PER_TASK": "96"
+    },
+    "faiss_omp": 24,
+    "torch_intraop": 24,
+    "torch_interop": 128
+  },
+  "fans": {
+    "cell_fan": 4,
+    "li_workers": 3,
+    "part_workers": 6,
+    "cell_procs": 1
+  },
+  "cpus": "96",
+  "mem_mb": "1019904",
+  "gpus": "6"
+}

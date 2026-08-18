@@ -1,0 +1,265 @@
+cluster: bamboo
+nodes:
+- cluster: bamboo
+  partition: public-interactive-gpu
+  gpu_model: nvidia_geforce_rtx_3090
+  gpu_count: 8
+  vram_gb: 24.0
+  compute_capability: '8.6'
+  driver_version: ''
+  cpu_ram_gb: 500.0
+  cpu_count: 128
+  node_name: gpu001
+  llm:
+    model: Qwen/Qwen3.5-122B-A10B-FP8
+    tensor_parallel_size: 2
+    max_model_len: 8192
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.92
+    kv_cache_tokens: 0
+    max_concurrency: 0.0
+    weights_bytes: 122000000000
+    kv_bytes_per_token: 24576
+    loop_ceiling: 1
+  mt:
+    model: facebook/nllb-200-3.3B
+    batch_size: 59836
+    beam_size: 4
+    max_seq_len: 512
+    weights_bytes: 6600000000
+- cluster: bamboo
+  partition: shared-gpu
+  gpu_model: nvidia_geforce_rtx_5090
+  gpu_count: 4
+  vram_gb: 32.0
+  compute_capability: '12.0'
+  driver_version: ''
+  cpu_ram_gb: 375.0
+  cpu_count: 96
+  node_name: gpu009
+  llm:
+    model: Qwen/Qwen3.5-122B-A10B-FP8
+    tensor_parallel_size: 2
+    max_model_len: 8192
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.92
+    kv_cache_tokens: 0
+    max_concurrency: 0.0
+    weights_bytes: 122000000000
+    kv_bytes_per_token: 24576
+    loop_ceiling: 1
+  mt:
+    model: facebook/nllb-200-3.3B
+    batch_size: 88174
+    beam_size: 4
+    max_seq_len: 512
+    weights_bytes: 6600000000
+- cluster: bamboo
+  partition: public-gpu,shared-gpu
+  gpu_model: nvidia_a100_80gb_pcie
+  gpu_count: 4
+  vram_gb: 80.0
+  compute_capability: '8.0'
+  driver_version: ''
+  cpu_ram_gb: 500.0
+  cpu_count: 16
+  # SLURM reserves two cores here, so the schedulable ceiling is 14 rather than 16 and a
+  # 15- or 16-CPU ask pinned to this node pends forever. cpu_count stays the raw CPUTot,
+  # which is what discovery reads; this is the number a schedulability check must use.
+  cpu_effective: 14
+  node_name: gpu003
+  llm:
+    model: Qwen/Qwen3.5-122B-A10B-FP8
+    tensor_parallel_size: 2
+    max_model_len: 8192
+    max_num_seqs: 26
+    gpu_memory_utilization: 0.92
+    kv_cache_tokens: 216239
+    max_concurrency: 26.3963623046875
+    weights_bytes: 122000000000
+    kv_bytes_per_token: 24576
+    loop_ceiling: 26
+  mt:
+    model: facebook/nllb-200-3.3B
+    batch_size: 258200
+    beam_size: 4
+    max_seq_len: 512
+    weights_bytes: 6600000000
+- cluster: bamboo
+  partition: shared-gpu
+  gpu_model: nvidia_h100_nvl
+  gpu_count: 1
+  vram_gb: 94.0
+  compute_capability: '9.0'
+  driver_version: ''
+  cpu_ram_gb: 750.0
+  cpu_count: 64
+  node_name: gpu004
+  llm:
+    model: Qwen/Qwen3.5-122B-A10B-FP8
+    tensor_parallel_size: 1
+    max_model_len: 8192
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.92
+    kv_cache_tokens: 0
+    max_concurrency: 0.0
+    weights_bytes: 122000000000
+    kv_bytes_per_token: 24576
+    loop_ceiling: 1
+  mt:
+    model: facebook/nllb-200-3.3B
+    batch_size: 307791
+    beam_size: 4
+    max_seq_len: 512
+    weights_bytes: 6600000000
+- cluster: bamboo
+  partition: shared-gpu
+  gpu_model: nvidia_rtx_pro_6000_blackwell
+  gpu_count: 4
+  vram_gb: 96.0
+  compute_capability: '9.0'
+  driver_version: ''
+  cpu_ram_gb: 754.88
+  cpu_count: 128
+  node_name: gpu007
+  llm:
+    model: Qwen/Qwen3.5-122B-A10B-FP8
+    tensor_parallel_size: 2
+    max_model_len: 8192
+    max_num_seqs: 55
+    gpu_memory_utilization: 0.92
+    kv_cache_tokens: 458055
+    max_concurrency: 55.9149169921875
+    weights_bytes: 122000000000
+    kv_bytes_per_token: 24576
+    loop_ceiling: 55
+  mt:
+    model: facebook/nllb-200-3.3B
+    batch_size: 314876
+    beam_size: 4
+    max_seq_len: 512
+    weights_bytes: 6600000000
+- cluster: bamboo
+  partition: shared-gpu
+  gpu_model: nvidia_h200_nvl
+  gpu_count: 4
+  vram_gb: 141.0
+  compute_capability: '9.0'
+  driver_version: ''
+  cpu_ram_gb: 750.0
+  cpu_count: 96
+  node_name: gpu006
+  llm:
+    model: Qwen/Qwen3.5-122B-A10B-FP8
+    tensor_parallel_size: 1
+    max_model_len: 8192
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.92
+    kv_cache_tokens: 72661
+    max_concurrency: 8.8697509765625
+    weights_bytes: 122000000000
+    kv_bytes_per_token: 24576
+    loop_ceiling: 8
+  mt:
+    model: facebook/nllb-200-3.3B
+    batch_size: 474276
+    beam_size: 4
+    max_seq_len: 512
+    weights_bytes: 6600000000
+# Measured replica-shape calibration, namespaced by serving.shapes.shape_key(model, role).
+# These rows are the only sanctioned source of batch knobs for a translate replica; the
+# mt.batch_size values in the node rows above come from serving.capacity.mt_capacity() and
+# are far too large to use.
+#
+# semantic_composition_ok is the acceptance test that matters: the fairness-hashed
+# composition (bucket_token_budget 16384 x max_sentences_per_bucket 512) is identical on
+# every card by construction, so a card that cannot host it is unusable for translate
+# however large its own ceiling is. The RTX 3090 fails it, which is why the GPU worker
+# template excludes it. A shape is usable once it has a row here; the rows below are the
+# calibrated set.
+shape_calibration:
+  facebook/nllb-200-3.3B@translate:
+    bwx1:
+      status: proven
+      vram_total_gb: 95.593
+      gpu_model: nvidia_rtx_pro_6000_blackwell
+      max_batch_tokens: 69632
+      max_sentences_per_batch: 1024
+      peak_gb_long: 42.111
+      peak_gb_short: 35.768
+      peak_gb_knee: 66.893
+      binding_case: knee
+      sentences_per_s_mixed_at_accepted: 24.65
+      accept_fraction: 0.85
+      semantic_composition_ok: true
+      semantic_max_batch_tokens: 16384
+      semantic_max_sentences_per_batch: 512
+      semantic_peak_gb: 24.768
+      sentences_per_s_semantic: 160.6
+      notes: knee (both budgets binding) exceeded the ceiling — pair shrunk to 
+        (100352, 1464); knee (both budgets binding) exceeded the ceiling — pair 
+        shrunk to (69632, 1024)
+      measured_on: 2026-07-29 gpu008
+    h100x1:
+      status: proven
+      vram_total_gb: 93.584
+      gpu_model: nvidia_h100_nvl
+      max_batch_tokens: 74752
+      max_sentences_per_batch: 1024
+      peak_gb_long: 43.51
+      peak_gb_short: 37.322
+      peak_gb_knee: 75.541
+      binding_case: knee
+      sentences_per_s_mixed_at_accepted: 76.05
+      accept_fraction: 0.85
+      semantic_composition_ok: true
+      semantic_max_batch_tokens: 16384
+      semantic_max_sentences_per_batch: 512
+      semantic_peak_gb: 27.479
+      sentences_per_s_semantic: 181.88
+      notes: knee (both budgets binding) exceeded the ceiling — pair shrunk to 
+        (107520, 1472); knee (both budgets binding) exceeded the ceiling — pair 
+        shrunk to (74752, 1024)
+      measured_on: 2026-07-30 gpu004
+    a100x1:
+      status: proven
+      vram_total_gb: 80.0
+      gpu_model: nvidia_a100_80gb_pcie
+      max_batch_tokens: 57344
+      max_sentences_per_batch: 1016
+      peak_gb_long: 35.295
+      peak_gb_short: 36.732
+      peak_gb_knee: 63.045
+      binding_case: knee
+      sentences_per_s_mixed_at_accepted: 26.56
+      accept_fraction: 0.85
+      semantic_composition_ok: true
+      semantic_max_batch_tokens: 16384
+      semantic_max_sentences_per_batch: 512
+      semantic_peak_gb: 26.764
+      sentences_per_s_semantic: 92.63
+      notes: knee (both budgets binding) exceeded the ceiling — pair shrunk to 
+        (82944, 1456); knee (both budgets binding) exceeded the ceiling — pair 
+        shrunk to (57344, 1016)
+      measured_on: 2026-07-29 gpu003
+    5090x1:
+      status: proven
+      vram_total_gb: 31.843
+      gpu_model: nvidia_geforce_rtx_5090
+      max_batch_tokens: 17408
+      max_sentences_per_batch: 280
+      peak_gb_long: 19.217
+      peak_gb_short: 17.873
+      peak_gb_knee: 25.279
+      binding_case: knee
+      sentences_per_s_mixed_at_accepted: 41.14
+      accept_fraction: 0.85
+      semantic_composition_ok: true
+      semantic_max_batch_tokens: 16384
+      semantic_max_sentences_per_batch: 512
+      semantic_peak_gb: 24.967
+      sentences_per_s_semantic: 174.18
+      notes: knee (both budgets binding) exceeded the ceiling — pair shrunk to 
+        (25600, 400); knee (both budgets binding) exceeded the ceiling — pair 
+        shrunk to (17408, 280)
+      measured_on: 2026-07-29 gpu009

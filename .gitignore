@@ -1,0 +1,52 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+venv/
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS and editor
+.DS_Store
+.idea/
+.vscode/
+
+# Run artifacts and job logs. The artifact tree is the checkpoint. It is
+# rebuilt by re-running, never version-controlled.
+runs/
+runs
+artifacts/
+ragtime-runs/
+logs/
+logs
+*.out
+*.err
+
+# Figure build: the local TeX package tree and the LaTeX intermediates. The
+# figure virtual environment is already covered by the Python rules above.
+docs/figures/.texmf/
+docs/figures/*.aux
+docs/figures/*.log
+
+# Fetched or built in place by following the reproduction guide, and
+# redistributed by neither this repository nor its licence: the organisers'
+# run validator, the Apptainer image, and the organisers' topics file.
+tools/
+*.sif
+topics/

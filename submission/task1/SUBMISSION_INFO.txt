@@ -1,0 +1,13 @@
+file name: T1_run_1.jsonl
+run name: T1-e2e-omt
+run description: E2E agentic RAG reading OMT (NLLB-200-3.3B) machine-translated English passages; per-sentence cited English report.
+
+file name: T1_run_2.jsonl
+run name: T1-e2e-omt-weak
+run description: E2E agentic RAG reading OMT-weak (low-tier Opus-MT) machine-translated English passages; per-sentence cited English report. Contrasts with T1-e2e-omt over the same passage inventory, so translation TIER is the only variable.
+
+file name: T1_run_3.jsonl
+run name: T1-e2e-original
+run description: E2E agentic RAG reading Original (native, un-translated) passages; per-sentence cited English report.
+
+Assessment priority: run_1 (highest), then run_2, then run_3.

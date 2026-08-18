@@ -1,0 +1,468 @@
+# Launch shapes, and whether each has been verified to host both halves of the stack at once.
+#
+# A shape is (gpu_model, gpus_taken) rather than a node: taking 2 of a node's 4 GPUs is a
+# different shape from taking 4, because under the proportional-ask rule it grants
+# different CPU and RAM.
+#
+# Whether a node shape has been tested is an infrastructure fact, not a run choice, so this
+# registry sits in config/serving/ beside the per-cluster capacity file rather than in the
+# hashed, fairness-controlled run configs.
+#
+# status: untested | pass | fail
+#   untested — the entry records arithmetic only.
+#   pass     — measured inside an allocation of this shape.
+#   fail     — measured and it did not fit.
+#
+# The three checks are independent and all three must pass before a shape is usable:
+#   llm        — the served model loads at this tensor-parallel size with the context needed.
+#   retrieval  — a full rendering's index loads inside the granted host RAM.
+#   coresident — both at once on the same node. Passing the first two separately does not
+#                imply this one; the host reserve for the vLLM process is the whole question.
+#
+# Read by `ragtime.serving.shapes`; the rows are recorded by hand from measured launches.
+
+cluster: bamboo
+
+# Late-interaction data is mmap'd and is not counted here.
+index_resident_gib:
+  native_index: 206.5
+  nllb_index: 206.1
+  opus_index: 208.9
+
+# The canonical serving shape: the only allocation a retrieval service may be launched in.
+# It is the single machine-readable definition of the resource request, so the sbatch file
+# and the submitting command line cannot drift apart.
+#
+# Scope: retrieval service and full-rendering retrieval gate allocations. It does not
+# constrain the preprocess or index-build jobs, the vLLM allocation, or CPU-only drivers.
+canonical_serving_shape:
+
+  cards:
+    # Four cards have enough VRAM for the query-time stack (the PLAID working set plus the
+    # three encoders and the reranker).
+    allowed:
+    - id: nvidia_a100_80gb_pcie
+      vram_gib: 80.0
+      note: "The LLM half served here at TP=2 with max_model_len 131072 (shapes[a100-x2])."
+    - id: nvidia_rtx_pro_6000_blackwell
+      vram_gib: 96.0
+      note: "2 cards / 48 c / 490G. The shape the reference measurements were taken in."
+    - id: nvidia_h200_nvl
+      vram_gib: 141.0
+      note: "Largest VRAM on the cluster. Allowed because its VRAM strictly dominates the
+        Blackwell that was measured; shapes[h200-x2] below carries status untested on all
+        three checks."
+    - id: nvidia_h100_nvl
+      vram_gib: 94.0
+      note: "config/serving/bamboo.yml records the H100 node with gpu_count 1, so gres=gpu:2
+        may be unsatisfiable on this cluster. Allowed by the spec; whether it schedules
+        depends on that single-card node."
+
+    # Measured failures. Both ran out of VRAM running the real query-time stack, so
+    # requesting either is refused outright. `job:` names the evidence behind the refusal, so
+    # the key stays even when there is nothing more specific to say than "a calibration run".
+    forbidden:
+    - id: nvidia_geforce_rtx_3090
+      vram_gib: 23.80
+      job: calibration run
+      note: "2 cards. CUDA out of memory with 23.55 of 23.80 GiB already in use.
+        Reproduced on a single card."
+    - id: nvidia_geforce_rtx_5090
+      vram_gib: 31.40
+      job: calibration run
+      note: "2 cards. CUDA out of memory with 31.13 of 31.40 GiB already in use."
+
+  # A retrieval-service sbatch must pin the card set in the file. Left unpinned, the
+  # scheduler is free to place the job on either of the measured failures above, since both
+  # live on shared-gpu nodes.
+  constraint_required_in_file: true
+
+  gpus: 2
+  replicas_per_card: 1
+  replicas_total: 2
+  # Two GPUs at one replica each, from a single-variable sweep on one warm process (same
+  # page cache, same index, same cards, only the fleet width moving), 20 real topics per
+  # arm: one replica per GPU gives the shipped median; one replica in total halves
+  # throughput; two replicas per GPU costs ~69% more latency for 1.18x throughput.
+  #
+  # Shell variables an rsvc sbatch uses to declare the fleet width, so the guard can read
+  # the width out of the file.
+  replicas_env_keys: [SVC_REPLICAS]
+  replica_devices_env_keys: [SVC_REPLICA_DEVICES]
+
+  # Everything query-time runs on CUDA. The device is a scientific variable, not a
+  # performance knob: CPU and CUDA late-interaction agree on only part of the top-100 and
+  # in a different order.
+  devices:
+    replica_devices: [cuda:0, cuda:1]
+    forbid_cpu_for:
+    - query_plaid_device
+    - plaid_device
+    - encode_device
+    - query_encode_device
+    - rerank_device
+    - reranker_device
+    - li_device
+    # Shell and environment spellings the rsvc scripts use for the same query-time devices.
+    forbid_cpu_for_env:
+    - SVC_GPU_PLAID
+    - SVC_GPU_MTD
+    - SVC_REPLICA_DEVICES
+    cpu_allowed_for:
+    # Build-time and chosen on measurement, never to be confused with query time.
+    - assemble_device
+    note: "CPU late-interaction measured 95.35 s/query at rerank_depth 100 against
+      5.58 s/query on cuda:0, on the same index and the same 20 warm queries. All six released
+      run configs declare query_plaid_device: \"cuda:0\". Device class also reorders the ranking,
+      measured separately: this is a scientific variable, not a speed knob."
+
+  # Host memory, not VRAM, is the binding constraint for a full rendering, and it binds on
+  # the cgroup grant rather than on node RAM. Retention needs roughly 410 GiB. Measured:
+  # 490G gives full retention, 400G degrades query latency by two orders of magnitude, and
+  # 300G falls to about a third of retention and faults every query off the shared
+  # filesystem. This overrides the proportional-ask rule: run fewer services per node,
+  # never a smaller --mem.
+  mem_gib_floor: 460
+  mem_gib_preferred: 490
+  mem_note: "the in-process path measured 255.2 GiB resident inside a 500G grant on one card."
+
+  # CPUs: the service productively used 48 (2 replicas, 24 cores per replica, cell fan 4).
+  # For the in-process path, cores beyond the leg-worker cap in
+  # ragtime.retrieval.concurrency are structurally unreachable and measurably harmful.
+  cpus_floor: 16
+  cpus_preferred: 48
+
+  # The CPU band, as floor / working floor / ceiling. The service path and the in-process
+  # path have different right answers, so a single number for both would be wrong.
+  #   16  hard floor, refused below by the sbatch guard reading cpus_floor. At 16 the
+  #       canonical two-replica fleet gets 8 cores per replica; it is a guard floor, not a
+  #       recommendation.
+  #   24  structural working floor: the launcher derives replicas as cpus/12, because a
+  #       cell fan of 4 (all four language cells in parallel) needs about 12 cores per
+  #       replica. 24 buys exactly that, with no headroom for the torch, Rayon and LMDB
+  #       threads.
+  #   48  shipped and measured: 24 cores per replica, cell fan 4, 3 late-interaction
+  #       workers, 6 part workers. Starvation below it is measured per replica rather than
+  #       per job.
+  #   48  is also the useful ceiling by the service's own derivation: at 24 cores per
+  #       replica every width that measurement says matters is already at its cap or
+  #       plateau. The only knob still moving above 48 needs 64 cores, and cold load does
+  #       not respond to cores at all.
+  cpus_ceiling_useful: 48
+  cpus_ceiling_useful_basis: derived_saturation_plus_no_measurement_above
+  cpus_working_floor: 24
+  cpus_unmeasured_above: 48
+  #
+  # Hard schedulability ceiling, per node rather than per job: a request above a node's
+  # effective CPU count can never land there. On this cluster the A100 node reports an
+  # effective 14 CPUs, which is below cpus_floor, so it cannot carry the shipped CPU shape
+  # even though its VRAM is adequate; the H100 node has a single card, so gres=gpu:2 is
+  # unsatisfiable there. At the canonical 48 cores the only nodes that can run this service
+  # are the Blackwell nodes and the untested H200.
+  cpus_ceiling_schedulable: node_cpuefctv
+  cpus_ceiling_schedulable_source: 'the scheduler''s own per-node report'
+
+# canonical_retrieval_service — how the shape above is launched.
+#
+# The entrypoint is a resource-free supervisor that reads this block and submits one
+# attempt per enabled placement, cancelling the rest as soon as one is allocated. A single
+# #SBATCH header cannot serve as the record of a race, since a race is N allocations that
+# differ.
+#
+# A placement declares only name, cards, cpus, exclude, enabled, degraded, measurement and
+# env. It cannot declare --mem, --gres or the partition; those come from
+# canonical_serving_shape above (mem_gib_preferred / gpus / replicas_total) and there is no
+# syntax for overriding them, because page-cache retention binds on the cgroup grant. Any
+# departure from cpus_preferred requires a non-empty `degraded` list, which is stamped into
+# the published service descriptor so a degraded measurement cannot be mistaken for a
+# canonical one.
+#
+# Architecture is a measurement variable, not a correctness one. The reference timings are
+# all Blackwell; if the race lands on H200 or A100 the service still answers correctly, but
+# a timing taken from it belongs to that architecture, which is why the winning placement's
+# card set and measurement status are published in the descriptor.
+canonical_retrieval_service:
+
+  # The one command. Everything below is what it reads.
+  entrypoint: slurm/retrieval_service.sbatch
+  # The body the race submits. Each placement's flags go on the sbatch command line, where
+  # they override the directives in the file, so one script serves every placement.
+  script: slurm/retrieval_service.sbatch
+  # The registry root is a site fact (which filesystem, which fleet), owned once by
+  # devkit.rsvc_registry and overridden per site by $RAGTIME_RSVC_REGISTRY, so it is
+  # spelled there and only there: one spelling keeps the supervisor and the clients on the
+  # same directory.
+  partition: shared-gpu
+  time: '12:00:00'
+
+  race:
+    # All at once rather than a staggered escalation. Tier escalation is the right shape
+    # when one card type must be protected from us; it is the wrong shape when the cluster
+    # is busy and we simply want the first free slot.
+    mode: all_at_once
+    stagger_s: 0
+    # One service at a time: as soon as any attempt is running, every other attempt for
+    # this lane is cancelled and its descriptor deleted in the same pass. If two allocate
+    # in the same instant the winner is the first enabled placement below, so a tie is
+    # resolved by this file rather than by whichever poll landed first. A cancelled attempt
+    # is never eligible to win again.
+    tie_break: placement_order
+    poll_s: 30
+    deadline_s: 21600
+
+  placements:
+
+  - name: blackwell
+    cards: [nvidia_rtx_pro_6000_blackwell]
+    cpus: 48
+    # This node carries intermittent uncorrectable ECC errors and is still schedulable.
+    exclude: gpu008
+    enabled: true
+    measurement:
+      status: pass
+      note: '2 cards / 48 c / 490G. The shape every reference timing was taken in, so a
+        timing from this placement is directly comparable to the ledger and one from any
+        other placement is not.'
+
+  - name: h200
+    cards: [nvidia_h200_nvl]
+    cpus: 48
+    enabled: true
+    measurement:
+      status: untested
+      note: 'Effective 94 CPUs and 750G, so 48 c / 490G / gpu:2 fits. Permitted because its
+        VRAM strictly dominates the Blackwell that was measured. It is enabled because
+        excluding it left free cards unusable, and any timing taken here must be stamped
+        H200 rather than folded into a Blackwell comparison.'
+
+  - name: a100
+    cards: [nvidia_a100_80gb_pcie]
+    # 14 rather than 48: the cluster's only A100 node has an effective 14 CPUs, so a
+    # 48-CPU ask can never land there. That is a different, worse shape rather than a
+    # smaller ask for the same one.
+    cpus: 14
+    enabled: false
+    degraded:
+    - 'cpu_starved: 14 c over 2 replicas is 3.5 c/replica, measured 19.76 s/query against
+      5.60 s at 24 c/replica. Below cpus_floor 16.'
+    - 'architecture_not_blackwell: no timing taken here is comparable to the ledger.'
+    measurement:
+      status: fail
+      note: 'Kept disabled with its reasons rather than deleted, because a placement that is
+        silently absent gets re-proposed. Enable it only to keep a lane alive when nothing
+        else will come, and read every number it produces as degraded.'
+
+  # Not placements, recorded so they are not added back. The launcher refuses these at load
+  # time; an attempt that can only pend looks, in a race, like a lane still being served.
+  never:
+    nvidia_h100_nvl: 'The H100 node has one card, so --gres=gpu:2 can never schedule.'
+    nvidia_geforce_rtx_5090: 'Measured out of memory at 31.13 of 31.40 GiB.'
+    nvidia_geforce_rtx_3090: 'Measured out of memory at 23.55 of 23.80 GiB.'
+
+# deployed_retrieval_service — the allocation that answered the submitted runs.
+#
+# The two blocks above describe the bamboo lane: two cards, one replica each, and it is what
+# slurm/retrieval_service.sbatch reproduces from a clean checkout. The filed submissions were
+# served from one long-lived six-card A100 allocation on a second cluster, joined as an overlap
+# step. The `a100` placement's `enabled: false` above is a statement about the bamboo A100 node,
+# whose 14 effective CPUs put it below cpus_floor, and says nothing about the node recorded here.
+#
+# It is written down because anyone comparing a re-run against our numbers needs the system
+# that produced them rather than the one the launcher defaults to. Reproducing it takes a node
+# with more than two cards, SVC_REPLICAS=1, and the extra flags listed under `flags`; the
+# shipped sbatch defaults to one reranker and no language-cell shard, so set them explicitly.
+deployed_retrieval_service:
+  gpu_model: nvidia_a100_80gb_pcie
+  gpus: 6
+  cpus: 96
+  mem: 996G
+
+  # The input is one replica. Because that is fewer than the card count, the launcher takes the
+  # single-stack path instead: it spreads the four language cells over the first four cards and
+  # resets the replica count to zero, since a per-language shard and a replica fleet are two
+  # answers to the same question and the service refuses both at once.
+  replicas_requested: 1
+  replicas_effective: 0
+  plaid_shard: "en=cuda:0,es=cuda:1,ru=cuda:2,zh=cuda:3"
+  encoders_device: "cuda:1"       # dense, sparse and the late-interaction query encoder
+  parts: {en: 23, es: 20, ru: 14, zh: 21}
+
+  # One reranker instance per card, forked before the parent touches CUDA so no child inherits a
+  # context. Six instances is what the query telemetry reports.
+  rerank_devices: ["cuda:0", "cuda:1", "cuda:2", "cuda:3", "cuda:4", "cuda:5"]
+  rerank_instances: 6
+  rerank_batch: 8
+  # Not set here: the depth is the run config's own retrieval.reranker.depth, which is 100 in all
+  # six released files, and a request may override it per query. The candidate set handed to the
+  # cross-encoder is the top `depth` of the fused ranking, sliced in the service.
+  rerank_depth_source: retrieval.reranker.depth
+
+  flags:
+    plaid_low_memory: false      # residency over compression; identical ranking either way
+    store_local: /dev/shm/ragtime-mirror   # the passage store in RAM, ~0.003 s per fetch
+
+  fans:
+    cell_fan: 4                  # the four language cells in parallel
+    cell_procs: 1                # processes rather than threads for the sparse leg
+    part_workers: 6
+    li_workers: 3
+    torch_threads: 24
+
+# canonical_vllm_shape — one vLLM instance per GPU pair, never two on the same pair.
+#
+# A pair rather than a free choice, because the served model has num_key_value_heads 2,
+# which caps tensor-parallel at 2 (TP=4 is unloadable, not merely wasteful), and its FP8
+# weights are ~113.6 GiB, which fits no single card here except an H200. So: 2 cards,
+# TP=2, one instance.
+#
+# Two instances on one pair is not a shape: vLLM reserves gpu_memory_utilization x total
+# VRAM at startup and refuses if that much is not free, so the second instance either fails
+# to start or forces both to a utilization where the KV cache cannot hold a full-length
+# sequence.
+#
+# The third card is not a vLLM card. Retrieval's canonical shape above is separately 2
+# cards, so a 4-GPU node can host one vLLM pair and one retrieval pair, but not two of
+# either.
+canonical_vllm_shape:
+  instances_per_gpu_pair: 1      # hard; two instances on one pair is never a shape
+  gpus: 2                        # --gres=gpu:2
+  tensor_parallel_size: 2        # equals SLURM_GPUS_ON_NODE; num_key_value_heads 2 forbids 4
+  gpu_memory_utilization: 0.92   # what the shipped argv sends (serving.node.vllm_server.server_argv)
+  cpus_per_task: 14              # the A100 ceiling; satisfiable on Blackwell and H200 too
+  mem: 180G
+  cards:
+    nvidia_rtx_pro_6000_blackwell:
+      status: pass
+      note: '96 GiB x2. Served at TP=2 for a 12 h walltime with no restarts.'
+    nvidia_h200_nvl:
+      status: untested
+      note: '141 GiB x2, the widest headroom. Permitted on VRAM.'
+    nvidia_a100_80gb_pcie:
+      status: untested
+      note: >-
+        80 GiB x2 = 160, which fits the 113.6 GiB of weights. Permitted, with a scheduling
+        caveat: the A100 node reports an effective 14 CPUs, so a job asking for
+        --cpus-per-task=16 can never land there whatever its GPU ask. That is why
+        cpus_per_task is 14 rather than 16. A scheduling fact, not a VRAM one.
+  # Topic affinity: a GPU pair owns a topic end to end, so the unit of parallelism is the
+  # topic rather than the request. Everything a topic needs — its seed decomposition, all k
+  # of its RAG loops, its coverage-audit rounds and its synthesis — is served by that pair's
+  # instance. Scaling out means giving a second pair a second topic.
+  #
+  #   1. KV-cache locality. A topic's k loops share the system prompt and re-read the same
+  #      passages; prefix caching makes that nearly free within one instance and worthless
+  #      across two.
+  #   2. Reproducibility. Sampled decoding is not batch-invariant, so a second client on the
+  #      same instance changes the round-0 nugget bank for a fixed seed.
+  #   3. Attribution. Work spread over two pairs puts a hardware term into the difference
+  #      between two runs of one topic, and the fairness comparison stops being controlled.
+  #
+  # Unenforced: a single shared endpoint file suits one development service, not a fan of
+  # pairs, since every client reads the same file and piles onto whichever pair wrote it
+  # last. A multi-pair launch needs a per-pair registry, as devkit.rsvc_registry already
+  # provides for retrieval.
+  topic_affinity:
+    unit_of_parallelism: topic
+    topics_per_pair_at_a_time: 1
+    split_a_topic_across_pairs: false     # scale by adding topics, never by splitting one
+    rendezvous_is_multi_pair_safe: false  # the endpoint file is single-endpoint today
+    rendezvous_note: >-
+      A single shared endpoint file is correct for one development service and wrong for a
+      fan of pairs. Replace it with a per-pair registry before any multi-topic launch.
+  excluded:
+    nvidia_h100_nvl: 'The H100 node has one card, so --gres=gpu:2 is unsatisfiable there.'
+    nvidia_geforce_rtx_5090: '32 GiB x2 = 64 < 113.6 GiB of weights. Cannot load at any TP.'
+    nvidia_geforce_rtx_3090: '24 GiB x2 = 48. Same.'
+
+shapes:
+- id: a100-x2
+  gpu_model: nvidia_a100_80gb_pcie
+  gpus: 2
+  of: 4
+  cpus: 8
+  mem_gib: 250
+  tp: 2
+  verified:
+    llm:
+      status: pass
+      note: "TP=2, max_model_len 131072, KV headroom 28.8 GiB."
+    retrieval: {status: untested}
+    coresident:
+      status: untested
+      basis: measured
+- id: a100-x4
+  gpu_model: nvidia_a100_80gb_pcie
+  gpus: 4
+  of: 4
+  cpus: 16
+  mem_gib: 500
+  tp: 2
+  verified:
+    llm: {status: untested, note: "TP stays 2 — num_key_value_heads 2 forbids TP=4. Two of
+        the four GPUs are held purely to release the node's RAM."}
+    retrieval: {status: untested}
+    coresident: {status: untested}
+
+- id: blackwell-x2
+  gpu_model: nvidia_rtx_pro_6000_blackwell
+  gpus: 2
+  of: 4
+  cpus: 32
+  mem_gib: 377
+  tp: 2
+  verified:
+    llm:
+      status: pass
+      note: "The shape every earlier successful bring-up used."
+    retrieval:
+      status: pass
+      basis: measured
+      note: 'Full original rendering, 78 parts, all four languages: 227.6 GiB resident
+        (206.5 index plus ~21 of models) inside a 377 GiB grant. That job held 1 GPU rather
+        than 2, but the RAM axis is what this check tests.'
+      peak_rss_gib: 227.6
+      granted_gib: 377
+    coresident: {status: untested}
+
+- id: blackwell-x4
+  gpu_model: nvidia_rtx_pro_6000_blackwell
+  gpus: 4
+  of: 4
+  cpus: 128
+  mem_gib: 755
+  tp: 2
+  verified:
+    llm: {status: untested}
+    retrieval: {status: untested}
+    coresident: {status: untested}
+
+- id: h200-x2
+  gpu_model: nvidia_h200_nvl
+  gpus: 2
+  of: 4
+  cpus: 48
+  mem_gib: 375
+  tp: 2
+  verified:
+    llm: {status: untested}
+    retrieval: {status: untested}
+    coresident: {status: untested}
+
+  # Kept as a recorded failure so it is not proposed again.
+- id: h200-x1
+  gpu_model: nvidia_h200_nvl
+  gpus: 1
+  of: 4
+  cpus: 24
+  mem_gib: 188
+  tp: 1
+  verified:
+    llm:
+      status: fail
+      note: "KV headroom 10.8 GiB after 118.4 GiB of weights, but one 131k-context sequence
+        costs 12.0 GiB, so it cannot serve at full context. An arithmetic result, from the
+        weight and cache sizes."
+    retrieval:
+      status: fail
+      note: "188 GiB granted, 209 GiB needed."
+    coresident: {status: fail}

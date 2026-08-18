@@ -1,0 +1,13 @@
+file name: T3_run_1.jsonl
+run name: T3-e2e-omt
+run description: Nugget bank from the e2e agentic run reading OMT (NLLB-200-3.3B) machine-translated English passages. Questions grown across coverage-audit rounds until novelty saturation, then deterministically deduplicated.
+
+file name: T3_run_2.jsonl
+run name: T3-e2e-omt-weak
+run description: Nugget bank from the e2e agentic run reading OMT-weak (low-tier Opus-MT) machine-translated English passages. Contrasts with T3-e2e-omt over the same passage inventory, so translation TIER is the only variable.
+
+file name: T3_run_3.jsonl
+run name: T3-e2e-original
+run description: Nugget bank from the e2e agentic run reading Original (native, un-translated) passages.
+
+Assessment priority: run_1 (highest), then run_2, then run_3.

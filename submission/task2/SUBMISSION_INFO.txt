@@ -1,0 +1,13 @@
+file name: T2_run_1.txt
+run name: mlir-original
+run description: Decomposition-driven retrieval searching the Original (native, un-translated) index, with documents ranked by the accumulated importance of the claims they support.
+
+file name: T2_run_2.txt
+run name: mlir-omt
+run description: Decomposition-driven retrieval searching our OMT index (the corpus machine-translated to English with NLLB-200-3.3B), with documents ranked by the accumulated importance of the claims they support.
+
+file name: T2_run_3.txt
+run name: mlir-omt-weak
+run description: Decomposition-driven retrieval searching the low-tier index (the corpus machine-translated to English with Opus-MT), with documents ranked by the accumulated importance of the claims they support.
+
+Assessment priority: run_1 (highest), then run_2, then run_3.
